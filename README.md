@@ -1,65 +1,61 @@
 # ternary-gate
 
-**Noise gate with attack/hold/release envelope for ternary audio.**
+**The sound of silence. When to shut up, and when to let it through.**
 
-A noise gate is the simplest dynamics processor: if the signal is above the threshold, let it through. If below, mute it. But real gates aren't binary — they have *attack* (how fast they open), *hold* (how long they stay open after signal drops), and *release* (how fast they close). These three parameters turn a crude on/off switch into a musical tool.
+A noise gate is the simplest dynamics processor and maybe the most musical: if the signal is loud enough, let it through. If it's too quiet, mute it. The threshold is the line between "music" and "noise." Below the line, silence. Above it, sound.
 
-This crate implements a full noise gate for ternary signals in `{-1, 0, +1}`. The ternary constraint makes the threshold meaningful: with only three values, gating is a *structural* decision, not just a level decision.
+But real gates aren't binary switches. They have *attack* (how fast they open — too fast and you get clicks, too slow and you miss the transient), *hold* (how long they stay open after the signal drops — prevents stuttering on decaying sounds), and *release* (how fast they close — too fast and you get a chopped-off tail, too slow and noise leaks in). These three parameters turn a crude on/off switch into a musical instrument.
 
 ## What's Inside
 
-- **`gate(signal, threshold, attack, hold, release)`** — full envelope noise gate
-  - `threshold`: absolute signal level to trigger opening
-  - `attack`: ticks to ramp from closed to open
-  - `hold`: ticks to stay open after signal drops below threshold
-  - `release`: ticks to ramp from open to closed
-- **`hard_gate(signal, threshold)`** — instant on/off, no envelope. Zero crossing protection
-- **`duck(signal, sidechain, threshold, depth)`** — ducking: reduce signal when sidechain is above threshold
+- **`NoiseGate`** — configurable gate with threshold, attack, hold, and release
+- **`process(signal)`** — apply the gate to a ternary signal. Returns gated output
+- **`sidechain(gate, control_signal, audio_signal)`** — gate the audio based on a *different* signal. The foundation of ducking and pumping effects
+- **`hysteresis(open_threshold, close_threshold)`** — the gate opens at one level, closes at a lower one. Prevents chatter at the threshold boundary
+- **`GateState`** — current state: `Closed`, `Attacking`, `Open`, `Holding`, `Releasing`
 
 ## Quick Example
 
 ```rust
 use ternary_gate::*;
 
-// A noisy signal with a few real hits
-let signal = vec![0, 0, 0, 1, 1, -1, 1, 0, 0, 0, 0];
+let mut gate = NoiseGate::new()
+    .threshold(0.5)   // open when RMS > 0.5
+    .attack(2)        // 2 ticks to fully open
+    .hold(4)          // stay open 4 ticks after signal drops
+    .release(8);      // 8 ticks to fully close
 
-// Gate with threshold=1, attack=1, hold=2, release=2
-let gated = gate(&signal, 1, 1, 2, 2);
-// First 3 zeros: closed (muted)
-// 1, 1, -1, 1: open (passed through)
-// Hold keeps gate open for 2 more ticks after signal drops
-// Release ramps down over 2 ticks
-// Result: noise removed, signal preserved, no clicks
+let noisy = vec![0, 0, 1, 1, -1, 0, 0, 0, 0, 0];
+let gated = gate.process(&noisy);
+// [0, 0, 1, 1, -1, ?, ?, ?, 0, 0]
+// Opens when signal hits, stays open through hold, gradually closes during release
 
-// Hard gate: instant on/off
-let hard = hard_gate(&signal, 1);
-// Only non-zero samples pass — more aggressive, potential clicks
-
-// Ducking: reduce music when voice is present
-let music = vec![1, 1, 1, 1, 1, 1];
-let voice = vec![0, 0, 1, 1, 0, 0]; // voice present in middle
-let ducked = duck(&music, &voice, 1, 0.5);
-// Music dips when voice is active
+// Sidechain: duck music when voice is present
+let voice = vec![0, 0, 1, 1, 1, 0, 0]; // voice active in middle
+let music = vec![1, 1, 1, 1, 1, 1, 1]; // constant music
+let ducked = sidechain(&gate, &voice, &music);
+// Music ducks down when voice is present
 ```
 
-## The Insight
+## The Deeper Truth
 
-**Attack/hold/release is the difference between a gate and a click.** Without the envelope, gating produces harsh on/off transitions that sound like artifacts. With the envelope, the gate *breathes* — it opens smoothly, holds through brief gaps, and closes gently. In ternary, this is even more important because each state change is already discrete — the envelope is the only smoothing tool you have.
+**Gating is the most important ternary effect because ternary already IS gated.** In continuous audio, gating removes everything below a threshold. In ternary, the 0 state is already "below threshold" — it IS silence. So gating a ternary signal means deciding when the ±1 values should become 0, and when the 0 values should become ±1. It's threshold detection at the most fundamental level.
+
+The sidechain is the secret weapon. In electronic music, sidechain compression (ducking the bass when the kick hits) creates the "breathing" effect that defines entire genres. In ternary, sidechain gating does the same thing with three states: one signal controls when the other signal is allowed to speak. This is the foundation of all call-and-response patterns in music — when one voice speaks, the others listen.
 
 **Use cases:**
-- **Audio processing** — clean up noisy ternary audio signals
-- **Drum pattern cleanup** — gate out low-level noise between hits
-- **Voice activation** — detect speech in noisy environments
-- **Signal conditioning** — prepare ternary signals for further processing
-- **Data stream filtering** — gate out uninteresting events in real-time streams
+- **Noise removal** — clean up signals by gating out the noise floor
+- **Rhythmic effects** — gated synths create stuttering, chopping patterns (trance gates)
+- **Sidechain ducking** — make room for vocals or drums in a mix
+- **Dynamic control** — turn continuous textures into rhythmic patterns
+- **Education** — the simplest dynamics processor, fully transparent
 
 ## See Also
 
-- **ternary-echo** — what comes AFTER the gate in an audio chain
-- **ternary-compressor** — (related) dynamics compression for ternary signals
-- **ternary-vu** — meter signal levels for gate threshold calibration
-- **ternary-bite** — signal degradation (the opposite aesthetic)
+- **ternary-vu** — meter the signal to know where to set the threshold
+- **ternary-envelope** — envelopes and gates work together (gate opens → envelope shapes)
+- **ternary-compressor** — (future) smooth dynamics control instead of hard gating
+- **ternary-rack** — wire gates into the signal chain
 
 ## Install
 
