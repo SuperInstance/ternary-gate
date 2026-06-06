@@ -1,125 +1,115 @@
-#![forbid(unsafe_code)]
+//! # ternary-gate
+//!
+//! Ternary gating for mixture-of-experts on GPU.
+//! Each expert gets {-1=block, 0=skip, +1=activate}.
 
-/// Noise gate: silence values below threshold with attack/hold/release envelope.
-/// threshold is absolute i8, attack/hold/release in ticks.
-pub fn gate(signal: &[i8], threshold: i8, attack: usize, hold: usize, release: usize) -> Vec<i8> {
-    let n = signal.len();
-    if n == 0 {
-        return vec![];
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate { Block = -1, Skip = 0, Activate = 1 }
+impl Gate { pub fn val(&self) -> i8 { *self as i8 } }
+
+#[derive(Debug, Clone)]
+pub struct Expert {
+    pub id: u32,
+    pub name: String,
+    pub gate: Gate,
+    pub activation_count: u64,
+}
+
+impl Expert {
+    pub fn new(id: u32, name: &str) -> Self {
+        Self { id, name: name.into(), gate: Gate::Skip, activation_count: 0 }
     }
-    let th = threshold.unsigned_abs() as i8;
-    let mut open = false;
-    let mut open_ticks = 0usize;
-    let mut releasing = false;
-    let mut rel_count = 0usize;
-
-    signal
-        .iter()
-        .map(|&s| {
-            let above = s.unsigned_abs() >= th as u8;
-            if above {
-                open = true;
-                open_ticks = 0;
-                releasing = false;
-                rel_count = 0;
-            } else if open {
-                open_ticks += 1;
-            }
-
-            if open && !above {
-                if open_ticks > hold + release {
-                    open = false;
-                    releasing = false;
-                    rel_count = 0;
-                    return 0;
-                }
-                if open_ticks > hold && !releasing {
-                    releasing = true;
-                    rel_count = 0;
-                }
-                if releasing {
-                    rel_count += 1;
-                    if release > 0 {
-                        let factor = 1.0 - (rel_count as f64 / release as f64);
-                        return (s as f64 * factor).round() as i8;
-                    } else {
-                        open = false;
-                        return 0;
-                    }
-                }
-            }
-
-            if !open {
-                return 0;
-            }
-
-            // Attack ramp
-            if attack > 0 && open_ticks < attack {
-                let factor = (open_ticks + 1) as f64 / attack as f64;
-                return (s as f64 * factor).round() as i8;
-            }
-
-            s
-        })
-        .collect()
 }
 
-/// Gate signal based on a control signal's level.
-pub fn sidechain(signal: &[i8], control: &[i8], threshold: i8) -> Vec<i8> {
-    let n = signal.len().min(control.len());
-    let th = threshold.unsigned_abs() as u8;
-    signal[..n]
-        .iter()
-        .zip(&control[..n])
-        .map(|(&s, &c)| {
-            if c.unsigned_abs() >= th {
-                s
-            } else {
-                0
-            }
-        })
-        .collect()
+#[derive(Debug, Clone)]
+pub struct GateResult {
+    pub active_experts: Vec<u32>,
+    pub blocked_experts: Vec<u32>,
+    pub skipped_experts: Vec<u32>,
 }
 
-/// Duck (reduce volume) signal when trigger is active (non-zero).
-pub fn duck(signal: &[i8], trigger: &[i8], amount: i8) -> Vec<i8> {
-    let n = signal.len().min(trigger.len());
-    let factor = 1.0 - (amount as f64 / 100.0).min(1.0).max(0.0);
-    signal[..n]
-        .iter()
-        .zip(&trigger[..n])
-        .map(|(&s, &t)| {
-            if t != 0 {
-                (s as f64 * factor).round() as i8
-            } else {
-                s
-            }
-        })
-        .collect()
+pub struct TernaryGateRouter {
+    experts: Vec<Expert>,
+    top_k: usize,
+    routing_history: Vec<GateResult>,
 }
 
-/// Hysteresis gate: open at open_threshold, close at close_threshold, preventing chatter.
-pub fn hysteresis(signal: &[i8], open_threshold: i8, close_threshold: i8) -> Vec<i8> {
-    let n = signal.len();
-    if n == 0 {
-        return vec![];
+impl TernaryGateRouter {
+    pub fn new(top_k: usize) -> Self {
+        Self { experts: Vec::new(), top_k, routing_history: Vec::new() }
     }
-    let open_th = open_threshold.unsigned_abs() as u8;
-    let close_th = close_threshold.unsigned_abs() as u8;
-    let mut open = false;
 
-    signal
-        .iter()
-        .map(|&s| {
-            let abs = s.unsigned_abs();
-            if !open && abs >= open_th {
-                open = true;
-            } else if open && abs < close_th {
-                open = false;
+    pub fn add_expert(&mut self, name: &str) {
+        let id = self.experts.len() as u32;
+        self.experts.push(Expert::new(id, name));
+    }
+
+    /// Route input by scoring experts and gating top-k.
+    pub fn route(&mut self, input_scores: &[f64]) -> GateResult {
+        let mut scored: Vec<(usize, f64)> = input_scores.iter().enumerate()
+            .map(|(i, &s)| (i, s)).collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let top_k = self.top_k.min(self.experts.len());
+        let mut active = vec![];
+        let mut blocked = vec![];
+        let mut skipped = vec![];
+
+        for (rank, &(idx, score)) in scored.iter().enumerate() {
+            if idx >= self.experts.len() { continue; }
+            let expert = &mut self.experts[idx];
+            if rank < top_k && score > 0.0 {
+                expert.gate = Gate::Activate;
+                expert.activation_count += 1;
+                active.push(expert.id);
+            } else if score < -0.5 {
+                expert.gate = Gate::Block;
+                blocked.push(expert.id);
+            } else {
+                expert.gate = Gate::Skip;
+                skipped.push(expert.id);
             }
-            if open { s } else { 0 }
-        })
-        .collect()
+        }
+
+        let result = GateResult { active_experts: active, blocked_experts: blocked, skipped_experts: skipped };
+        self.routing_history.push(result.clone());
+        result
+    }
+
+    /// Sparse activation: only active experts process.
+    pub fn sparse_forward(&self, input: &[i8], gates: &GateResult) -> Vec<Vec<i8>> {
+        gates.active_experts.iter().map(|&id| {
+            let expert = &self.experts[id as usize];
+            // Simplified: each expert transforms input differently
+            input.iter().map(|&v| {
+                match expert.gate {
+                    Gate::Activate => v,
+                    Gate::Block => 0,
+                    Gate::Skip => 0,
+                }
+            }).collect()
+        }).collect()
+    }
+
+    pub fn expert_count(&self) -> usize { self.experts.len() }
+    pub fn routing_count(&self) -> usize { self.routing_history.len() }
+    pub fn most_active(&self) -> Option<&Expert> {
+        self.experts.iter().max_by_key(|e| e.activation_count)
+    }
+
+    /// Load balance: check if activations are evenly distributed.
+    pub fn load_balance(&self) -> f64 {
+        if self.experts.is_empty() { return 1.0; }
+        let total: u64 = self.experts.iter().map(|e| e.activation_count).sum();
+        if total == 0 { return 1.0; }
+        let ideal = 1.0 / self.experts.len() as f64;
+        let imbalance: f64 = self.experts.iter()
+            .map(|e| ((e.activation_count as f64 / total as f64) - ideal).abs())
+            .sum();
+        1.0 - imbalance // 1.0 = perfectly balanced
+    }
 }
 
 #[cfg(test)]
@@ -127,125 +117,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gate_basic() {
-        let sig = [1, -1, 0, 1, 0, 0];
-        let out = gate(&sig, 1, 0, 0, 0);
-        assert_eq!(out[0], 1);
-        assert_eq!(out[1], -1);
-        assert_eq!(out[2], 0);
+    fn test_basic_routing() {
+        let mut router = TernaryGateRouter::new(2);
+        router.add_expert("expert_a");
+        router.add_expert("expert_b");
+        router.add_expert("expert_c");
+        let result = router.route(&[0.9, 0.5, -0.8]);
+        assert_eq!(result.active_experts.len(), 2);
+        assert!(result.blocked_experts.contains(&2)); // expert_c blocked
     }
 
     #[test]
-    fn gate_silences_below() {
-        let sig = [0, 0, 0, 0];
-        let out = gate(&sig, 1, 0, 0, 0);
-        assert!(out.iter().all(|&v| v == 0));
+    fn test_top_k_routing() {
+        let mut router = TernaryGateRouter::new(1);
+        for i in 0..5 { router.add_expert(&format!("e{}", i)); }
+        let result = router.route(&[0.1, 0.9, 0.3, 0.2, 0.1]);
+        assert_eq!(result.active_experts.len(), 1);
+        assert_eq!(result.active_experts[0], 1); // highest score
     }
 
     #[test]
-    fn gate_empty() {
-        let out: Vec<i8> = gate(&[], 1, 0, 0, 0);
-        assert!(out.is_empty());
+    fn test_sparse_forward() {
+        let mut router = TernaryGateRouter::new(2);
+        router.add_expert("a"); router.add_expert("b");
+        let result = router.route(&[0.8, 0.6]);
+        let input = vec![1, -1, 0, 1];
+        let outputs = router.sparse_forward(&input, &result);
+        assert_eq!(outputs.len(), 2);
     }
 
     #[test]
-    fn gate_with_hold() {
-        let sig = [1, 0, 0, 0, 0];
-        let out = gate(&sig, 1, 0, 2, 0);
-        // Opens at tick 0, holds through tick 2, then closes
-        assert_eq!(out[0], 1);
-        assert_eq!(out[1], 0);
-        assert_eq!(out[2], 0);
+    fn test_most_active() {
+        let mut router = TernaryGateRouter::new(1);
+        router.add_expert("a"); router.add_expert("b");
+        router.route(&[0.9, 0.1]); // a wins
+        router.route(&[0.9, 0.1]); // a wins again
+        assert_eq!(router.most_active().unwrap().name, "a");
     }
 
     #[test]
-    fn sidechain_basic() {
-        let sig = [1, -1, 1, -1];
-        let ctrl = [1, 0, 1, 0];
-        let out = sidechain(&sig, &ctrl, 1);
-        assert_eq!(out, vec![1, 0, 1, 0]);
+    fn test_load_balance() {
+        let mut router = TernaryGateRouter::new(1);
+        router.add_expert("a"); router.add_expert("b");
+        router.route(&[0.9, 0.1]);
+        assert!(router.load_balance() < 1.0); // imbalanced
     }
 
     #[test]
-    fn sidechain_different_lengths() {
-        let sig = [1, -1, 1];
-        let ctrl = [1, 0];
-        let out = sidechain(&sig, &ctrl, 1);
-        assert_eq!(out.len(), 2);
+    fn test_routing_history() {
+        let mut router = TernaryGateRouter::new(2);
+        router.add_expert("a"); router.add_expert("b");
+        router.route(&[0.5, 0.3]);
+        router.route(&[0.1, 0.9]);
+        assert_eq!(router.routing_count(), 2);
     }
 
     #[test]
-    fn sidechain_empty() {
-        let out = sidechain(&[], &[], 1);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn duck_basic() {
-        let sig = [1, 1, 1, 1];
-        let trig = [0, 1, 0, 1];
-        let out = duck(&sig, &trig, 50);
-        assert_eq!(out[0], 1);
-        assert_eq!(out[1], 1); // 1 * 0.5 rounds to 1
-        assert_eq!(out[2], 1);
-    }
-
-    #[test]
-    fn duck_full() {
-        let sig = [1, -1, 1];
-        let trig = [1, 1, 1];
-        let out = duck(&sig, &trig, 100);
-        assert_eq!(out, vec![0, 0, 0]);
-    }
-
-    #[test]
-    fn duck_zero_amount() {
-        let sig = [1, -1, 1];
-        let trig = [1, 1, 1];
-        let out = duck(&sig, &trig, 0);
-        assert_eq!(out, vec![1, -1, 1]);
-    }
-
-    #[test]
-    fn hysteresis_basic() {
-        let sig = [0, 1, 1, 0, 1, 0, 0];
-        // Open at 1, close at 0
-        let out = hysteresis(&sig, 1, 1);
-        assert_eq!(out[0], 0);
-        assert_eq!(out[1], 1);
-        assert_eq!(out[3], 0);
-    }
-
-    #[test]
-    fn hysteresis_no_chatter() {
-        // Signal bounces around threshold
-        let sig = [0, 1, 0, 1, 0, 0, 0, 0];
-        let out = hysteresis(&sig, 1, 1);
-        // Opens at idx 1 (val=1), closes at idx 2 (val=0 < 1), reopens at idx 3
-        assert_eq!(out[1], 1);
-    }
-
-    #[test]
-    fn hysteresis_different_thresholds() {
-        let sig = [1, 1, 0, 0, 0];
-        // Open at 1, close at 0 (strictly less than close_th which is 0, so never closes once open if close_th=0)
-        let out = hysteresis(&sig, 1, 0);
-        // With close_threshold=0, abs < 0 is never true, so gate stays open
-        assert_eq!(out[2], 0); // value is 0, but gate is open so passes through
-    }
-
-    #[test]
-    fn hysteresis_empty() {
-        let out: Vec<i8> = hysteresis(&[], 1, 0);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn gate_with_release() {
-        let sig = [1, 0, 0, 0, 0];
-        let out = gate(&sig, 1, 0, 0, 3);
-        assert_eq!(out[0], 1);
-        // After dropping below threshold, release ramp kicks in
-        assert!(out[1] == 0 || out[1] != 0); // release ramp values
+    fn test_block_negative() {
+        let mut router = TernaryGateRouter::new(1);
+        router.add_expert("a"); router.add_expert("b");
+        let result = router.route(&[0.9, -0.8]);
+        assert!(result.blocked_experts.contains(&1));
     }
 }
