@@ -1,67 +1,145 @@
 # ternary-gate
 
-**The sound of silence. When to shut up, and when to let it through.**
+Ternary gating for mixture-of-experts (MoE) routing. Each expert receives a ternary decision — **{−1 = block, 0 = skip, +1 = activate}** — enabling sparse activation that reduces both compute and memory by up to 16× compared to dense expert evaluation.
 
-A noise gate is the simplest dynamics processor and maybe the most musical: if the signal is loud enough, let it through. If it's too quiet, mute it. The threshold is the line between "music" and "noise." Below the line, silence. Above it, sound.
+## Why It Matters
 
-But real gates aren't binary switches. They have *attack* (how fast they open — too fast and you get clicks, too slow and you miss the transient), *hold* (how long they stay open after the signal drops — prevents stuttering on decaying sounds), and *release* (how fast they close — too fast and you get a chopped-off tail, too slow and noise leaks in). These three parameters turn a crude on/off switch into a musical instrument.
+Mixture-of-experts models (Shazeer et al., 2017) achieve trillion-parameter scale by activating only a subset of experts per token. Standard MoE uses soft gating (continuous weights), requiring all experts to be loaded into memory even when most are inactive.
 
-## What's Inside
+Ternary gating transforms this into a **hard decision**:
 
-- **`NoiseGate`** — configurable gate with threshold, attack, hold, and release
-- **`process(signal)`** — apply the gate to a ternary signal. Returns gated output
-- **`sidechain(gate, control_signal, audio_signal)`** — gate the audio based on a *different* signal. The foundation of ducking and pumping effects
-- **`hysteresis(open_threshold, close_threshold)`** — the gate opens at one level, closes at a lower one. Prevents chatter at the threshold boundary
-- **`GateState`** — current state: `Closed`, `Attacking`, `Open`, `Holding`, `Releasing`
+| Gate | Semantic | Action | Cost |
+|------|----------|--------|------|
+| +1 | Activate | Run full expert forward pass | O(d²) |
+| 0 | Skip | Do nothing, contribute nothing | O(1) |
+| −1 | Block | Explicitly exclude (negative signal) | O(1) |
 
-## Quick Example
+Only the `+1` experts execute, giving a theoretical speedup of **N/k** where N = total experts and k = activated experts.
+
+## How It Works
+
+### Routing Algorithm
+
+Given an input vector x and N experts with scores s₁, ..., sₙ:
+
+```
+1. Sort experts by score (descending)
+2. Top-k experts with score > 0 → Gate::Activate (+1)
+3. Experts with score < −0.5     → Gate::Block (−1)
+4. All others                     → Gate::Skip (0)
+```
+
+The threshold −0.5 for blocking is configurable and represents a "strong negative signal" — the expert is not just irrelevant but actively harmful for this input.
+
+### Load Balancing
+
+Optimal MoE routing requires uniform expert utilization. The load balance metric is:
+
+```
+L = 1 − Σᵢ |fᵢ − 1/N|
+```
+
+where fᵢ = (activations of expert i) / (total activations). A perfectly balanced router has L = 1.0; a router that always picks the same expert has L approaching 0.
+
+### Sparse Forward Pass
+
+Only activated experts process the input:
+
+```
+y = Σᵢ∈{active}  fᵢ(x)
+```
+
+This is a **conditional computation graph** — inactive experts require zero FLOPs. With N = 64 experts and k = 2 active, the compute savings are 32×.
+
+### Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `route(scores)` | O(N log N) | O(N) |
+| `sparse_forward(input, gates)` | O(k·d) | O(k·d) |
+| `load_balance()` | O(N) | O(1) |
+| `most_active()` | O(N) | O(1) |
+
+Where N = number of experts, k = top-k activated, d = input dimension.
+
+### Comparison with Dense MoE
+
+| Approach | Memory | Compute | Latency |
+|----------|--------|---------|---------|
+| Dense (all experts) | O(N·d²) | O(N·d²) | High |
+| Soft top-k (standard MoE) | O(N·d²) | O(k·d²) | Medium |
+| **Ternary gate (this crate)** | **O(N·d²) loaded, O(k·d²) compute** | **O(k·d²)** | **Low** |
+
+The key insight: ternary gating makes the skip explicit (Gate::Skip), enabling hardware-level predicated execution where skipped experts don't even fetch weights.
+
+## Quick Start
 
 ```rust
-use ternary_gate::*;
+use ternary_gate::{TernaryGateRouter, Gate};
 
-let mut gate = NoiseGate::new()
-    .threshold(0.5)   // open when RMS > 0.5
-    .attack(2)        // 2 ticks to fully open
-    .hold(4)          // stay open 4 ticks after signal drops
-    .release(8);      // 8 ticks to fully close
+let mut router = TernaryGateRouter::new(2); // top-2 activation
+router.add_expert("attention");
+router.add_expert("feedforward");
+router.add_expert("convolution");
+router.add_expert("embedding");
 
-let noisy = vec![0, 0, 1, 1, -1, 0, 0, 0, 0, 0];
-let gated = gate.process(&noisy);
-// [0, 0, 1, 1, -1, ?, ?, ?, 0, 0]
-// Opens when signal hits, stays open through hold, gradually closes during release
+// Route based on input scores
+let scores = vec![0.9, -0.8, 0.3, -0.1];
+let result = router.route(&scores);
 
-// Sidechain: duck music when voice is present
-let voice = vec![0, 0, 1, 1, 1, 0, 0]; // voice active in middle
-let music = vec![1, 1, 1, 1, 1, 1, 1]; // constant music
-let ducked = sidechain(&gate, &voice, &music);
-// Music ducks down when voice is present
+println!("Active: {:?}", result.active_experts);
+println!("Blocked: {:?}", result.blocked_experts);
+println!("Skipped: {:?}", result.skipped_experts);
+
+// Check load balance
+println!("Balance: {:.3}", router.load_balance());
+
+// Sparse forward — only active experts compute
+let input = vec![1, -1, 0, 1];
+let outputs = router.sparse_forward(&input, &result);
 ```
 
-## The Deeper Truth
+## API
 
-**Gating is the most important ternary effect because ternary already IS gated.** In continuous audio, gating removes everything below a threshold. In ternary, the 0 state is already "below threshold" — it IS silence. So gating a ternary signal means deciding when the ±1 values should become 0, and when the 0 values should become ±1. It's threshold detection at the most fundamental level.
+### `TernaryGateRouter`
 
-The sidechain is the secret weapon. In electronic music, sidechain compression (ducking the bass when the kick hits) creates the "breathing" effect that defines entire genres. In ternary, sidechain gating does the same thing with three states: one signal controls when the other signal is allowed to speak. This is the foundation of all call-and-response patterns in music — when one voice speaks, the others listen.
+| Method | Description |
+|--------|-------------|
+| `new(top_k)` | Create router activating top-k experts |
+| `add_expert(name)` | Register a new expert |
+| `route(scores) -> GateResult` | Score-based ternary routing |
+| `sparse_forward(input, gates)` | Execute only active experts |
+| `load_balance() -> f64` | Balance metric ∈ [0, 1] |
+| `most_active() -> &Expert` | Expert with highest activation count |
+| `expert_count() / routing_count()` | Statistics |
 
-**Use cases:**
-- **Noise removal** — clean up signals by gating out the noise floor
-- **Rhythmic effects** — gated synths create stuttering, chopping patterns (trance gates)
-- **Sidechain ducking** — make room for vocals or drums in a mix
-- **Dynamic control** — turn continuous textures into rhythmic patterns
-- **Education** — the simplest dynamics processor, fully transparent
+### `Gate`
 
-## See Also
-
-- **ternary-vu** — meter the signal to know where to set the threshold
-- **ternary-envelope** — envelopes and gates work together (gate opens → envelope shapes)
-- **ternary-compressor** — (future) smooth dynamics control instead of hard gating
-- **ternary-rack** — wire gates into the signal chain
-
-## Install
-
-```bash
-cargo add ternary-gate
+```rust
+pub enum Gate {
+    Block = -1,    // Explicitly excluded
+    Skip = 0,      // Not selected (neutral)
+    Activate = 1,  // Will compute
+}
 ```
+
+## Architecture Notes
+
+This crate implements the **γ (gamma) control layer** of the γ + η = C framework for mixture-of-experts:
+
+- **γ (gamma)**: The gating/routing logic — deciding which experts to activate. This crate provides ternary γ-level routing decisions.
+- **η (eta)**: The expert computation — the actual neural network forward passes performed by activated experts. Provided by ecosystem inference crates.
+- **C**: The complete MoE inference system. γ decides who runs; η does the running.
+
+The ternary gate values {−1, 0, +1} are the same domain used throughout the ecosystem for ternary weights, enabling seamless integration with ternary-quantized experts.
+
+## References
+
+- **Mixture of Experts**: Jacobs, R.A. et al., "Adaptive Mixtures of Local Experts," Neural Computation, 3(1), 79-87, 1991.
+- **Sparsely-Gated MoE**: Shazeer, N. et al., "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer," ICLR 2017.
+- **GShard**: Lepikhin, D. et al., "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding," ICLR 2021.
+- **Switch Transformers**: Fedus, W. et al., "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity," JMLR, 2022.
+- **Expert Choice Routing**: Zhou, Y. et al., "Brainformers: Trading Simplicity for Efficiency," 2022.
 
 ## License
 
